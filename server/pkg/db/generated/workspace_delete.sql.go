@@ -36,6 +36,12 @@ deleted_channel_task_deliveries AS (
 ),
 deleted_draft_restores AS (
     DELETE FROM chat_draft_restore WHERE task_id IN (SELECT id FROM batch)
+),
+deleted_issue_run_lease_audit AS (
+    DELETE FROM issue_run_lease_audit WHERE task_id IN (SELECT id FROM batch)
+),
+deleted_issue_run_leases AS (
+    DELETE FROM issue_run_lease WHERE task_id IN (SELECT id FROM batch)
 )
 DELETE FROM agent_task_queue WHERE id IN (SELECT id FROM batch)
 `
