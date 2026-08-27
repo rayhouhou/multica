@@ -6286,7 +6286,17 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 		}
 		overlay := s.buildRuntimeMCPOverlay(ctx, originator, target.agent)
 		requestedTaskID := dbid.NewV7()
-		dispatchKey := issueDispatchEventKey(target.issue, target.agent.ID, target.comment.ID, pgtype.UUID{})
+		// A delegated-failure delivery may be retried after an earlier recovery
+		// task terminalizes without delivering its comment. The attempt ordinal
+		// keeps those intentional successors distinct, while concurrent sweeps of
+		// the same attempt converge on one durable event key.
+		dispatchKey := pgtype.Text{String: fmt.Sprintf(
+			"issue:%s:role:%s:delegated-failure:%s:attempt:%d",
+			util.UUIDToString(target.issue.ID),
+			util.UUIDToString(target.agent.ID),
+			util.UUIDToString(target.failed.ID),
+			recoveryTasks+1,
+		), Valid: true}
 		task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
 			ID:                   requestedTaskID,
 			AgentID:              target.agent.ID,
