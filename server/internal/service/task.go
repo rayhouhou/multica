@@ -193,6 +193,7 @@ const (
 	// stretching this global crash-recovery window.
 	claimResponseRecoveryWindow = 90 * time.Second
 	prepareLeaseDuration        = 45 * time.Second
+	issueRunLeaseDuration       = 90 * time.Second
 )
 
 func (s *TaskService) trackTaskForReclaim(task db.AgentTaskQueue, checkAfter time.Time) {
@@ -652,6 +653,11 @@ var ErrAttributionFailClosed = errors.New("attribution: no precise accountable h
 // including the index name, is logged once at debug and never wrapped in) so no
 // upper-layer log or response can leak the constraint name (#5914, Elon review).
 var ErrDuplicatePendingTask = errors.New("a pending task for this issue and agent already exists")
+
+// ErrIssueRunLeaseHeld means another generation currently owns the canonical
+// issue writer slot for this agent-role. Callers should leave the task
+// non-running and retry only after cancellation, expiry, or explicit takeover.
+var ErrIssueRunLeaseHeld = errors.New("issue run lease is held by another task")
 
 // isDuplicatePendingTaskErr reports whether err is the pending-task unique-index
 // violation (a concurrent enqueue won the race). Accept both names while v1 and
@@ -1143,6 +1149,24 @@ func headShaText(sha string) pgtype.Text {
 	return pgtype.Text{String: sha, Valid: sha != ""}
 }
 
+// issueDispatchEventKey gives every issue trigger a durable identity. Comment
+// delivery is keyed by the immutable comment UUID; assignment/status delivery
+// is keyed by the issue revision that produced it. The agent id is the current
+// generic role key: distinct writer/reviewer/lander agents remain independently
+// fenced without teaching the platform programme-specific role names.
+func issueDispatchEventKey(issue db.Issue, agentID, triggerCommentID, rerunOfTaskID pgtype.UUID) pgtype.Text {
+	issueID := util.UUIDToString(issue.ID)
+	agent := util.UUIDToString(agentID)
+	switch {
+	case rerunOfTaskID.Valid:
+		return pgtype.Text{String: fmt.Sprintf("issue:%s:role:%s:rerun:%s", issueID, agent, util.UUIDToString(rerunOfTaskID)), Valid: true}
+	case triggerCommentID.Valid:
+		return pgtype.Text{String: fmt.Sprintf("issue:%s:role:%s:comment:%s", issueID, agent, util.UUIDToString(triggerCommentID)), Valid: true}
+	default:
+		return pgtype.Text{String: fmt.Sprintf("issue:%s:role:%s:revision:%d", issueID, agent, issue.Revision), Valid: true}
+	}
+}
+
 // ResolveIssueReviewSHAParam is ResolveIssueReviewSHA wrapped as the pgtype.Text
 // the dedup queries take, so both service- and handler-package call sites can
 // key dedup on the reviewed head with a single call (TEN-356).
@@ -1211,6 +1235,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		DispatchEventKey:     issueDispatchEventKey(issue, issue.AssigneeID, triggerCommentID, rerunOfTaskID),
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1241,6 +1266,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 			RerunOfTaskID:        createParams.RerunOfTaskID,
 			TriggerEvidenceKind:  createParams.TriggerEvidenceKind,
 			TriggerEvidenceRefID: createParams.TriggerEvidenceRefID,
+			DispatchEventKey:     createParams.DispatchEventKey,
 			FireAt:               fireAt,
 		})
 	} else {
@@ -1365,6 +1391,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		DispatchEventKey:     issueDispatchEventKey(issue, agentID, triggerCommentID, rerunOfTaskID),
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1442,6 +1469,7 @@ func (s *TaskService) EnqueueDeferredAssigneeFallback(ctx context.Context, issue
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		DispatchEventKey:     issueDispatchEventKey(issue, agentID, triggerCommentID, pgtype.UUID{}),
 	})
 	if err != nil {
 		slog.Error("deferred fallback enqueue failed", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "error", err)
@@ -3995,9 +4023,38 @@ func (s *TaskService) maybeLogClaimSlow(agentID pgtype.UUID, outcome string, sta
 // StartTask transitions a dispatched task to running.
 // Issue status is NOT changed here — the agent manages it via the CLI.
 func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	task, err := s.Queries.StartAgentTask(ctx, taskID)
+	task, err := s.Queries.StartAgentTask(ctx, db.StartAgentTaskParams{
+		TaskID:    taskID,
+		LeaseSecs: issueRunLeaseDuration.Seconds(),
+	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil &&
+				existing.IssueID.Valid && existing.Status != "completed" && existing.Status != "failed" && existing.Status != "cancelled" {
+				slog.Warn("issue run lease suppressed duplicate writer",
+					"task_id", util.UUIDToString(existing.ID),
+					"issue_id", util.UUIDToString(existing.IssueID),
+					"role_key", util.UUIDToString(existing.AgentID),
+				)
+				return nil, ErrIssueRunLeaseHeld
+			}
+		}
 		return nil, fmt.Errorf("start task: %w", err)
+	}
+	if task.IssueID.Valid && task.IssueLeaseGeneration.Valid {
+		event := "acquired"
+		if task.IssueLeaseGeneration.Int64 > 1 {
+			event = "takeover"
+		}
+		if err := s.Queries.RecordIssueRunLeaseAudit(ctx, db.RecordIssueRunLeaseAuditParams{
+			IssueID:    task.IssueID,
+			RoleKey:    util.UUIDToString(task.AgentID),
+			TaskID:     task.ID,
+			Generation: task.IssueLeaseGeneration.Int64,
+			Event:      event,
+		}); err != nil {
+			slog.Warn("record issue run lease audit failed", "task_id", util.UUIDToString(task.ID), "error", err)
+		}
 	}
 	s.forgetTaskReclaim(task)
 	s.cancelDeferredEscalationsForTask(ctx, task.ID)
@@ -4017,6 +4074,45 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID) (*db.Ag
 	// on the transition users care about most.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskRunning, task)
 	return &task, nil
+}
+
+// RenewIssueRunLeases keeps every running issue task owned by a live runtime
+// ahead of the takeover deadline. The daemon heartbeat is the durable liveness
+// signal, so no per-agent process protocol is required.
+func (s *TaskService) RenewIssueRunLeases(ctx context.Context, runtimeID pgtype.UUID) {
+	leases, err := s.Queries.RenewIssueRunLeasesForRuntime(ctx, db.RenewIssueRunLeasesForRuntimeParams{
+		RuntimeID: runtimeID,
+		LeaseSecs: issueRunLeaseDuration.Seconds(),
+	})
+	if err != nil {
+		slog.Warn("renew issue run leases failed", "runtime_id", util.UUIDToString(runtimeID), "error", err)
+		return
+	}
+	if len(leases) > 0 {
+		slog.Debug("issue run leases renewed", "runtime_id", util.UUIDToString(runtimeID), "count", len(leases))
+	}
+}
+
+func (s *TaskService) releaseIssueRunLease(ctx context.Context, task db.AgentTaskQueue) {
+	if !task.IssueID.Valid || !task.IssueLeaseGeneration.Valid {
+		return
+	}
+	lease, err := s.Queries.ReleaseIssueRunLeaseForTask(ctx, task.ID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("release issue run lease failed", "task_id", util.UUIDToString(task.ID), "error", err)
+		}
+		return
+	}
+	if err := s.Queries.RecordIssueRunLeaseAudit(ctx, db.RecordIssueRunLeaseAuditParams{
+		IssueID:    lease.IssueID,
+		RoleKey:    lease.RoleKey,
+		TaskID:     lease.TaskID,
+		Generation: lease.Generation,
+		Event:      "released",
+	}); err != nil {
+		slog.Warn("record issue run lease release audit failed", "task_id", util.UUIDToString(task.ID), "error", err)
+	}
 }
 
 func (s *TaskService) cancelDeferredEscalationsForTask(ctx context.Context, taskID pgtype.UUID) {
@@ -4376,6 +4472,7 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 	}
 
 	// Reconcile agent status
+	s.releaseIssueRunLease(ctx, task)
 	s.ReconcileAgentStatus(ctx, task.AgentID)
 
 	// Broadcast
@@ -4963,6 +5060,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		}
 	}
 	// Reconcile agent status
+	s.releaseIssueRunLease(ctx, task)
 	s.ReconcileAgentStatus(ctx, task.AgentID)
 
 	// Broadcast. Channel subscribers need the same redacted failure text that
@@ -6141,6 +6239,7 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			RuleVersionID:        ruleVersionID,
 			TriggerEvidenceKind:  pgtype.Text{String: string(attribution.EvidenceDelegatedFailure), Valid: true},
 			TriggerEvidenceRefID: target.failed.ID,
+			DispatchEventKey:     issueDispatchEventKey(target.issue, target.agent.ID, target.comment.ID, pgtype.UUID{}),
 			HeadSha:              headShaText(s.ResolveIssueReviewSHA(ctx, target.issue.ID)),
 		})
 		if err == nil {

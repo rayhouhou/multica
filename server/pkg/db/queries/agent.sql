@@ -333,7 +333,7 @@ INSERT INTO agent_task_queue (
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id, trigger_evidence_kind, trigger_evidence_ref_id,
-    id
+    dispatch_event_key, id
 )
 SELECT
     $1, $2, $3, 'queued', $4, sqlc.narg(trigger_comment_id),
@@ -358,8 +358,11 @@ SELECT
     sqlc.narg(rerun_of_task_id),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
+    sqlc.narg(dispatch_event_key),
     COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 WHERE lock_task_owner_rows($1, $3, $2)
+ON CONFLICT (dispatch_event_key) WHERE dispatch_event_key IS NOT NULL
+DO UPDATE SET dispatch_event_key = EXCLUDED.dispatch_event_key
 RETURNING *;
 
 -- name: CreateDeferredChannelIssueTask :one
@@ -376,7 +379,7 @@ INSERT INTO agent_task_queue (
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id,
     trigger_evidence_kind, trigger_evidence_ref_id, fire_at,
-    id
+    dispatch_event_key, id
 )
 SELECT
     $1, $2, $3, 'deferred', $4, sqlc.narg(trigger_comment_id),
@@ -401,8 +404,11 @@ SELECT
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
     @fire_at,
+    sqlc.narg(dispatch_event_key),
     COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 WHERE lock_task_owner_rows($1, $3, $2)
+ON CONFLICT (dispatch_event_key) WHERE dispatch_event_key IS NOT NULL
+DO UPDATE SET dispatch_event_key = EXCLUDED.dispatch_event_key
 RETURNING *;
 
 -- name: PromoteDeferredChannelIssueTask :one
@@ -473,7 +479,7 @@ INSERT INTO agent_task_queue (
     trigger_summary, is_leader_task, squad_id, escalation_for_task_id, fire_at,
     originator_user_id, accountable_user_id, originator_source,
     delegated_from_task_id, trigger_evidence_kind, trigger_evidence_ref_id,
-    id
+    dispatch_event_key, id
 )
 SELECT
     @agent_id, @runtime_id, @issue_id, 'deferred', @priority,
@@ -489,8 +495,11 @@ SELECT
     sqlc.narg(delegated_from_task_id),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
+    sqlc.narg(dispatch_event_key),
     COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
 WHERE lock_task_owner_rows($1, $3, $2)
+ON CONFLICT (dispatch_event_key) WHERE dispatch_event_key IS NOT NULL
+DO UPDATE SET dispatch_event_key = EXCLUDED.dispatch_event_key
 RETURNING *;
 
 -- name: LinkTaskToIssue :exec
@@ -989,13 +998,79 @@ RETURNING *;
 -- the lock was acquired the daemon flips here). wait_reason is cleared on
 -- the transition so a future read can't conflate "currently waiting" with
 -- "previously waited".
-UPDATE agent_task_queue
+WITH target AS (
+    SELECT *
+    FROM agent_task_queue
+    WHERE id = @task_id AND status IN ('dispatched', 'waiting_local_directory')
+    FOR UPDATE
+), acquired AS (
+    INSERT INTO issue_run_lease (issue_id, role_key, task_id, generation, expires_at)
+    SELECT issue_id, agent_id::text, id, 1,
+           now() + make_interval(secs => @lease_secs::double precision)
+    FROM target
+    WHERE issue_id IS NOT NULL
+    ON CONFLICT (issue_id, role_key) DO UPDATE
+    SET task_id = EXCLUDED.task_id,
+        generation = issue_run_lease.generation + 1,
+        expires_at = EXCLUDED.expires_at,
+        acquired_at = now(),
+        renewed_at = now()
+    WHERE issue_run_lease.task_id = EXCLUDED.task_id
+       OR issue_run_lease.expires_at <= now()
+       OR NOT EXISTS (
+            SELECT 1 FROM agent_task_queue owner
+            WHERE owner.id = issue_run_lease.task_id
+              AND owner.status IN ('dispatched', 'running', 'waiting_local_directory')
+       )
+    RETURNING generation
+)
+UPDATE agent_task_queue task
 SET status = 'running',
     started_at = now(),
     wait_reason = NULL,
-    prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'waiting_local_directory')
+    prepare_lease_expires_at = NULL,
+    issue_lease_generation = CASE
+        WHEN task.issue_id IS NULL THEN NULL
+        ELSE (SELECT generation FROM acquired)
+    END
+WHERE task.id = @task_id
+  AND task.status IN ('dispatched', 'waiting_local_directory')
+  AND (task.issue_id IS NULL OR EXISTS (SELECT 1 FROM acquired))
 RETURNING *;
+
+-- name: TaskHoldsCurrentIssueRunLease :one
+SELECT task_holds_current_issue_run_lease(@task_id)::boolean;
+
+-- name: RenewIssueRunLeasesForRuntime :many
+UPDATE issue_run_lease lease
+SET expires_at = now() + make_interval(secs => @lease_secs::double precision),
+    renewed_at = now()
+FROM agent_task_queue task
+WHERE task.runtime_id = @runtime_id
+  AND task.status = 'running'
+  AND task.issue_id = lease.issue_id
+  AND task.agent_id::text = lease.role_key
+  AND task.id = lease.task_id
+  AND task.issue_lease_generation = lease.generation
+RETURNING lease.*;
+
+-- name: ReleaseIssueRunLeaseForTask :one
+UPDATE issue_run_lease lease
+SET expires_at = now(), renewed_at = now()
+FROM agent_task_queue task
+WHERE task.id = @task_id
+  AND task.issue_id = lease.issue_id
+  AND task.agent_id::text = lease.role_key
+  AND task.id = lease.task_id
+  AND task.issue_lease_generation = lease.generation
+RETURNING lease.*;
+
+-- name: RecordIssueRunLeaseAudit :exec
+INSERT INTO issue_run_lease_audit (
+    issue_id, role_key, task_id, generation, event, detail
+) VALUES (
+    @issue_id, @role_key, @task_id, @generation, @event, sqlc.narg(detail)
+);
 
 -- name: MarkAgentTaskWaitingLocalDirectory :one
 -- Transitions a freshly-dispatched task into 'waiting_local_directory' while
@@ -1035,7 +1110,9 @@ SET status = 'completed', completed_at = now(), result = $2,
     session_rollout_missing = sqlc.arg('session_rollout_missing'),
     retired_session_id = COALESCE(sqlc.narg('retired_session_id'), retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status = 'running'
+WHERE id = $1
+  AND status = 'running'
+  AND task_holds_current_issue_run_lease(id)
 RETURNING *;
 
 -- name: GetLastTaskSession :one
@@ -1273,7 +1350,9 @@ SET status = 'failed',
     session_rollout_missing = sqlc.arg('session_rollout_missing'),
     retired_session_id = COALESCE(sqlc.narg('retired_session_id'), retired_session_id),
     prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
+WHERE id = $1
+  AND status IN ('dispatched', 'running', 'waiting_local_directory')
+  AND task_holds_current_issue_run_lease(id)
 RETURNING *;
 
 -- name: UpdateAgentTaskSession :exec
@@ -1582,7 +1661,9 @@ RETURNING task.*;
 -- stable once terminal, so this CAS cannot race a legitimate write.
 UPDATE agent_task_queue
 SET branch_name = COALESCE(branch_name, sqlc.arg('branch_name'))
-WHERE id = sqlc.arg('id') AND status = 'cancelled';
+WHERE id = sqlc.arg('id')
+  AND status = 'cancelled'
+  AND task_holds_current_issue_run_lease(id);
 
 -- name: SetAgentTaskDurableWorkDir :exec
 -- Records the durable replacement for a disposable worktree on a CANCELLED
@@ -1591,7 +1672,9 @@ WHERE id = sqlc.arg('id') AND status = 'cancelled';
 -- and COALESCE makes replays idempotent.
 UPDATE agent_task_queue
 SET durable_work_dir = COALESCE(durable_work_dir, sqlc.arg('durable_work_dir'))
-WHERE id = sqlc.arg('id') AND status = 'cancelled';
+WHERE id = sqlc.arg('id')
+  AND status = 'cancelled'
+  AND task_holds_current_issue_run_lease(id);
 
 -- name: SetAgentTaskErrorIfEmpty :exec
 -- Companion to SetAgentTaskBranchName for the cancel-ack path. A cancelled
@@ -1605,7 +1688,10 @@ WHERE id = sqlc.arg('id') AND status = 'cancelled';
 UPDATE agent_task_queue
 SET error = sqlc.arg('error'),
     failure_reason = COALESCE(failure_reason, sqlc.arg('failure_reason'))
-WHERE id = sqlc.arg('id') AND (error IS NULL OR error = '') AND status = 'cancelled';
+WHERE id = sqlc.arg('id')
+  AND (error IS NULL OR error = '')
+  AND status = 'cancelled'
+  AND task_holds_current_issue_run_lease(id);
 
 -- name: CancelAgentTaskWithReason :one
 -- Cancels a task AND records why, for cancellations the user did not ask for.
