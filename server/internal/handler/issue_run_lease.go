@@ -10,9 +10,14 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// requireCurrentIssueRunLease fences task-token writes to issue state. Human
-// callers remain governed by membership/revision checks; machine callers must
-// additionally prove that their task owns the current lease generation.
+// requireCurrentIssueRunLease fences task-token writes to an issue's own run
+// state. Human callers remain governed by membership/revision checks. A machine
+// caller writing to the issue its task is bound to must additionally prove it
+// owns the current lease generation. A write to any OTHER issue is orchestration
+// (assigning writers, promoting stage barriers) and passes through to the
+// ordinary membership/revision checks — the run lease exists to serialize
+// canonical writers on one issue, and was never scoped to restrict cross-issue
+// orchestration.
 func (h *Handler) requireCurrentIssueRunLease(w http.ResponseWriter, r *http.Request, issue db.Issue) bool {
 	if r.Header.Get("X-Actor-Source") != "task_token" {
 		return true
@@ -24,9 +29,15 @@ func (h *Handler) requireCurrentIssueRunLease(w http.ResponseWriter, r *http.Req
 		return false
 	}
 	task, err := h.Queries.GetAgentTask(r.Context(), taskID)
-	if err != nil || !task.IssueID.Valid || task.IssueID != issue.ID {
+	if err != nil {
 		writeError(w, http.StatusForbidden, "task does not own this issue")
 		return false
+	}
+	// A task holds a run lease only on its own issue. A write to any other issue
+	// is orchestration and stays governed by membership authz plus the caller's
+	// optimistic revision check, not this lease.
+	if !task.IssueID.Valid || task.IssueID != issue.ID {
+		return true
 	}
 
 	current, err := h.Queries.TaskHoldsCurrentIssueRunLease(r.Context(), taskID)

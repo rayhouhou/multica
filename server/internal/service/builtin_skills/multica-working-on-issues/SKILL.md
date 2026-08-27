@@ -140,11 +140,14 @@ Not metadata: logs or summaries; runtime bookkeeping such as timestamps,
 attempt counts, or agent IDs; or other single-run details such as
 files touched and investigation notes — those belong in the result comment.
 
-Issue mutations made with a task token are fenced by the current issue/agent
-run lease. A superseded task receives `409 stale_issue_run` when it tries to
-change status, metadata, labels, branch information, or PR linkage. Stop on
-that response: a newer run owns the issue. Human-authenticated writes are not
-subject to the run lease.
+Task-token mutations to the issue the run is bound to are fenced by that
+issue/agent run lease. A superseded task receives `409 stale_issue_run` when it
+tries to change status, metadata, labels, branch information, or PR linkage on
+its own issue. Stop on that response: a newer run owns the issue. Writes to any
+other issue — the cross-issue orchestration a coordinating run performs, such as
+assigning a writer or promoting a stage — are not fenced by the run lease; they
+are governed by ordinary membership authz and the revision check. Human-
+authenticated writes are not subject to the run lease either.
 
 ```bash
 multica issue metadata set <issue-id> --key <key> --value <value>
