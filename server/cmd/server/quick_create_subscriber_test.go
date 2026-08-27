@@ -69,7 +69,7 @@ func TestQuickCreateFailure_DoesNotSubscribeRequester(t *testing.T) {
 	); err != nil {
 		t.Fatalf("dispatch task: %v", err)
 	}
-	if _, err := queries.StartAgentTask(ctx, task.ID); err != nil {
+	if _, err := queries.StartAgentTask(ctx, db.StartAgentTaskParams{TaskID: task.ID, LeaseSecs: 90}); err != nil {
 		t.Fatalf("StartAgentTask: %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestQuickCreateFailure_SurfacesAgentOutput(t *testing.T) {
 	); err != nil {
 		t.Fatalf("dispatch task: %v", err)
 	}
-	if _, err := queries.StartAgentTask(ctx, task.ID); err != nil {
+	if _, err := queries.StartAgentTask(ctx, db.StartAgentTaskParams{TaskID: task.ID, LeaseSecs: 90}); err != nil {
 		t.Fatalf("StartAgentTask: %v", err)
 	}
 
@@ -211,7 +211,7 @@ func TestQuickCreateLookupFault_WritesUnconfirmedInbox(t *testing.T) {
 	); err != nil {
 		t.Fatalf("dispatch task: %v", err)
 	}
-	if _, err := queries.StartAgentTask(ctx, task.ID); err != nil {
+	if _, err := queries.StartAgentTask(ctx, db.StartAgentTaskParams{TaskID: task.ID, LeaseSecs: 90}); err != nil {
 		t.Fatalf("StartAgentTask: %v", err)
 	}
 
@@ -292,7 +292,7 @@ func TestQuickCreateFailure_RedactsAgentOutput(t *testing.T) {
 	); err != nil {
 		t.Fatalf("dispatch task: %v", err)
 	}
-	if _, err := queries.StartAgentTask(ctx, task.ID); err != nil {
+	if _, err := queries.StartAgentTask(ctx, db.StartAgentTaskParams{TaskID: task.ID, LeaseSecs: 90}); err != nil {
 		t.Fatalf("StartAgentTask: %v", err)
 	}
 
@@ -361,7 +361,7 @@ func TestQuickCreateLookupCancelled_StillWritesUnconfirmedInbox(t *testing.T) {
 	); err != nil {
 		t.Fatalf("dispatch task: %v", err)
 	}
-	if _, err := queries.StartAgentTask(setupCtx, task.ID); err != nil {
+	if _, err := queries.StartAgentTask(setupCtx, db.StartAgentTaskParams{TaskID: task.ID, LeaseSecs: 90}); err != nil {
 		t.Fatalf("StartAgentTask: %v", err)
 	}
 
