@@ -1256,6 +1256,9 @@ func (h *Handler) processHeartbeat(ctx context.Context, rt db.AgentRuntime, supp
 		m.UpdateMs = time.Since(updateStart).Milliseconds()
 		return nil, m, err
 	}
+	if h.TaskService != nil {
+		h.TaskService.RenewIssueRunLeases(ctx, rt.ID)
+	}
 	m.UpdateMs = time.Since(updateStart).Milliseconds()
 
 	slog.Debug("daemon heartbeat", "runtime_id", runtimeID)
@@ -3548,6 +3551,13 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	task, err := h.TaskService.StartTask(r.Context(), parseUUID(taskID))
 	if err != nil {
 		slog.Warn("start task failed", "task_id", taskID, "error", err)
+		if errors.Is(err, service.ErrIssueRunLeaseHeld) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"code":  "issue_run_lease_held",
+				"error": err.Error(),
+			})
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -3743,6 +3753,13 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// missing continuity-gap flag.
 	task, err := h.TaskService.CompleteTask(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.BranchName, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir)
 	if err != nil {
+		if errors.Is(err, service.ErrIssueRunLeaseFenced) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"code":  "stale_issue_run",
+				"error": err.Error(),
+			})
+			return
+		}
 		// A CompleteTask error is an infrastructure failure (transaction /
 		// assistant-outcome write), not a bad request: an already-finalized
 		// callback is treated as idempotent success and returns no error. Return
@@ -4439,6 +4456,13 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 	// pointer or miss the continuity gap.
 	task, err := h.TaskService.FailTask(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.BranchName, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir)
 	if err != nil {
+		if errors.Is(err, service.ErrIssueRunLeaseFenced) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"code":  "stale_issue_run",
+				"error": err.Error(),
+			})
+			return
+		}
 		// A FailTask error is an infrastructure failure (the terminal
 		// transaction that also clears the withheld session, writes the
 		// continuity-gap flag, and creates the auto-retry rolled back), not a bad

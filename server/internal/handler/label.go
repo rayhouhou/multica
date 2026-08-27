@@ -437,6 +437,9 @@ func (h *Handler) AttachLabel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !h.requireCurrentIssueRunLease(w, r, issue) {
+		return
+	}
 	labelID, ok := parseUUIDOrBadRequest(w, req.LabelID, "label_id")
 	if !ok {
 		return
@@ -508,6 +511,9 @@ func (h *Handler) DetachLabel(w http.ResponseWriter, r *http.Request) {
 	// explicit 404.
 	issue, ok := h.loadIssueForUser(w, r, issueID)
 	if !ok {
+		return
+	}
+	if !h.requireCurrentIssueRunLease(w, r, issue) {
 		return
 	}
 	labelUUID, ok := parseUUIDOrBadRequest(w, labelID, "label id")
