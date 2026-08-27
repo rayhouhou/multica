@@ -659,6 +659,10 @@ var ErrDuplicatePendingTask = errors.New("a pending task for this issue and agen
 // non-running and retry only after cancellation, expiry, or explicit takeover.
 var ErrIssueRunLeaseHeld = errors.New("issue run lease is held by another task")
 
+// ErrIssueRunLeaseFenced means the task reached a write boundary after a newer
+// generation took over its issue/role lease.
+var ErrIssueRunLeaseFenced = errors.New("task no longer owns the current issue run lease")
+
 // isDuplicatePendingTaskErr reports whether err is the pending-task unique-index
 // violation (a concurrent enqueue won the race). Accept both names while v1 and
 // v2 can coexist during a rolling deploy.
@@ -1243,7 +1247,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	var task db.AgentTaskQueue
 	if fireAt.Valid {
 		task, err = s.Queries.CreateDeferredChannelIssueTask(ctx, db.CreateDeferredChannelIssueTaskParams{
-			ID:                   dbid.NewV7(),
+			ID:                   createParams.ID,
 			AgentID:              createParams.AgentID,
 			RuntimeID:            createParams.RuntimeID,
 			IssueID:              createParams.IssueID,
@@ -1275,6 +1279,14 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	if err != nil {
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", err)
 		return db.AgentTaskQueue{}, fmt.Errorf("create task: %w", err)
+	}
+	if task.ID != createParams.ID {
+		slog.Info("task enqueue idempotent replay suppressed",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(issue.ID),
+			"dispatch_event_key", createParams.DispatchEventKey.String,
+		)
+		return task, nil
 	}
 
 	slog.Info("task enqueued",
@@ -1368,8 +1380,10 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
+	requestedTaskID := dbid.NewV7()
+	dispatchKey := issueDispatchEventKey(issue, agentID, triggerCommentID, rerunOfTaskID)
 	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
-		ID:                   dbid.NewV7(),
+		ID:                   requestedTaskID,
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1391,7 +1405,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
-		DispatchEventKey:     issueDispatchEventKey(issue, agentID, triggerCommentID, rerunOfTaskID),
+		DispatchEventKey:     dispatchKey,
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1408,6 +1422,14 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		}
 		slog.Error("mention task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "error", err)
 		return db.AgentTaskQueue{}, fmt.Errorf("create task: %w", err)
+	}
+	if task.ID != requestedTaskID {
+		slog.Info("mention task enqueue idempotent replay suppressed",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(issue.ID),
+			"dispatch_event_key", dispatchKey.String,
+		)
+		return task, nil
 	}
 
 	slog.Info("mention task enqueued", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "is_leader_task", isLeader)
@@ -1451,8 +1473,10 @@ func (s *TaskService) EnqueueDeferredAssigneeFallback(ctx context.Context, issue
 	}
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
 	isLeader := squadID.Valid
+	requestedTaskID := dbid.NewV7()
+	dispatchKey := issueDispatchEventKey(issue, agentID, triggerCommentID, pgtype.UUID{})
 	task, err := s.Queries.CreateDeferredAgentTask(ctx, db.CreateDeferredAgentTaskParams{
-		ID:                   dbid.NewV7(),
+		ID:                   requestedTaskID,
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1469,11 +1493,19 @@ func (s *TaskService) EnqueueDeferredAssigneeFallback(ctx context.Context, issue
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
-		DispatchEventKey:     issueDispatchEventKey(issue, agentID, triggerCommentID, pgtype.UUID{}),
+		DispatchEventKey:     dispatchKey,
 	})
 	if err != nil {
 		slog.Error("deferred fallback enqueue failed", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "error", err)
 		return db.AgentTaskQueue{}, fmt.Errorf("create deferred task: %w", err)
+	}
+	if task.ID != requestedTaskID {
+		slog.Info("deferred fallback enqueue idempotent replay suppressed",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(issue.ID),
+			"dispatch_event_key", dispatchKey.String,
+		)
+		return task, nil
 	}
 
 	slog.Info("deferred fallback task enqueued",
@@ -4115,6 +4147,33 @@ func (s *TaskService) releaseIssueRunLease(ctx context.Context, task db.AgentTas
 	}
 }
 
+func (s *TaskService) issueRunLeaseFenced(ctx context.Context, task db.AgentTaskQueue, detail string) bool {
+	if !task.IssueID.Valid || !task.IssueLeaseGeneration.Valid {
+		return false
+	}
+	current, err := s.Queries.TaskHoldsCurrentIssueRunLease(ctx, task.ID)
+	if err != nil || current {
+		return false
+	}
+	if auditErr := s.Queries.RecordIssueRunLeaseAudit(ctx, db.RecordIssueRunLeaseAuditParams{
+		IssueID:    task.IssueID,
+		RoleKey:    util.UUIDToString(task.AgentID),
+		TaskID:     task.ID,
+		Generation: task.IssueLeaseGeneration.Int64,
+		Event:      "fenced_write",
+		Detail:     pgtype.Text{String: detail, Valid: detail != ""},
+	}); auditErr != nil {
+		slog.Warn("record terminal fenced write failed", "task_id", util.UUIDToString(task.ID), "error", auditErr)
+	}
+	slog.Warn("stale terminal task write fenced",
+		"task_id", util.UUIDToString(task.ID),
+		"issue_id", util.UUIDToString(task.IssueID),
+		"role_key", util.UUIDToString(task.AgentID),
+		"operation", detail,
+	)
+	return true
+}
+
 func (s *TaskService) cancelDeferredEscalationsForTask(ctx context.Context, taskID pgtype.UUID) {
 	cancelled, err := s.Queries.CancelDeferredEscalationsForTask(ctx, taskID)
 	if err != nil {
@@ -4361,6 +4420,9 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 		// Treat it as an idempotent success — same pattern as CancelTask.
 		if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				if s.issueRunLeaseFenced(ctx, existing, "complete") {
+					return nil, ErrIssueRunLeaseFenced
+				}
 				slog.Info("complete task: already finalized",
 					"task_id", util.UUIDToString(taskID),
 					"current_status", existing.Status,
@@ -4960,6 +5022,9 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 	}); err != nil {
 		if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				if s.issueRunLeaseFenced(ctx, existing, "fail") {
+					return nil, ErrIssueRunLeaseFenced
+				}
 				slog.Info("fail task: already finalized",
 					"task_id", util.UUIDToString(taskID),
 					"current_status", existing.Status,
@@ -6220,8 +6285,10 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			ruleVersionID = target.source.RuleVersionID
 		}
 		overlay := s.buildRuntimeMCPOverlay(ctx, originator, target.agent)
+		requestedTaskID := dbid.NewV7()
+		dispatchKey := issueDispatchEventKey(target.issue, target.agent.ID, target.comment.ID, pgtype.UUID{})
 		task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
-			ID:                   dbid.NewV7(),
+			ID:                   requestedTaskID,
 			AgentID:              target.agent.ID,
 			RuntimeID:            target.agent.RuntimeID,
 			IssueID:              target.issue.ID,
@@ -6239,10 +6306,13 @@ func (s *TaskService) dispatchDelegatedFailureRecovery(ctx context.Context, targ
 			RuleVersionID:        ruleVersionID,
 			TriggerEvidenceKind:  pgtype.Text{String: string(attribution.EvidenceDelegatedFailure), Valid: true},
 			TriggerEvidenceRefID: target.failed.ID,
-			DispatchEventKey:     issueDispatchEventKey(target.issue, target.agent.ID, target.comment.ID, pgtype.UUID{}),
+			DispatchEventKey:     dispatchKey,
 			HeadSha:              headShaText(s.ResolveIssueReviewSHA(ctx, target.issue.ID)),
 		})
 		if err == nil {
+			if task.ID != requestedTaskID {
+				return delegatedFailureRecoveryCovered, nil
+			}
 			slog.Info("delegated failure recovery task enqueued",
 				"failed_task_id", util.UUIDToString(target.failed.ID),
 				"source_task_id", util.UUIDToString(target.source.ID),

@@ -172,6 +172,8 @@ type AgentTaskQueue struct {
 	BranchName                pgtype.Text `json:"branch_name"`
 	DurableWorkDir            pgtype.Text `json:"durable_work_dir"`
 	ChannelContextRevision    pgtype.Int8 `json:"channel_context_revision"`
+	IssueLeaseGeneration      pgtype.Int8 `json:"issue_lease_generation"`
+	DispatchEventKey          pgtype.Text `json:"dispatch_event_key"`
 }
 
 type AgentToLabel struct {
@@ -828,6 +830,27 @@ type IssueReaction struct {
 	ActorID     pgtype.UUID        `json:"actor_id"`
 	Emoji       string             `json:"emoji"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type IssueRunLease struct {
+	IssueID    pgtype.UUID        `json:"issue_id"`
+	RoleKey    string             `json:"role_key"`
+	TaskID     pgtype.UUID        `json:"task_id"`
+	Generation int64              `json:"generation"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	AcquiredAt pgtype.Timestamptz `json:"acquired_at"`
+	RenewedAt  pgtype.Timestamptz `json:"renewed_at"`
+}
+
+type IssueRunLeaseAudit struct {
+	ID         pgtype.UUID        `json:"id"`
+	IssueID    pgtype.UUID        `json:"issue_id"`
+	RoleKey    string             `json:"role_key"`
+	TaskID     pgtype.UUID        `json:"task_id"`
+	Generation int64              `json:"generation"`
+	Event      string             `json:"event"`
+	Detail     pgtype.Text        `json:"detail"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
 type IssueSourceContext struct {

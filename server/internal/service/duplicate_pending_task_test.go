@@ -46,11 +46,10 @@ func TestIsDuplicatePendingTaskErr(t *testing.T) {
 	}
 }
 
-// TestEnqueueTaskForMentionCoalescesDuplicatePendingTask is the service-level
-// regression for #5914: a second mention enqueue for the same (issue, agent)
-// that loses the race to an existing pending task must return the typed
-// ErrDuplicatePendingTask sentinel — not a raw create-task error carrying the
-// Postgres constraint name — and must leave exactly one pending task behind.
+// TestEnqueueTaskForMentionCoalescesDuplicatePendingTask keeps two distinct
+// guarantees separate: replaying one durable trigger returns its original task,
+// while a genuinely new trigger that collides with the pending slot returns the
+// typed ErrDuplicatePendingTask sentinel.
 func TestEnqueueTaskForMentionCoalescesDuplicatePendingTask(t *testing.T) {
 	pool := newResolveOriginatorPool(t)
 	ctx := context.Background()
@@ -72,12 +71,21 @@ func TestEnqueueTaskForMentionCoalescesDuplicatePendingTask(t *testing.T) {
 	svc := &TaskService{Queries: q, TxStarter: pool, Bus: events.New()}
 
 	// First mention creates the pending task.
-	if _, err := svc.EnqueueTaskForMention(ctx, issueStruct, util.MustParseUUID(agentID), pgtype.UUID{}); err != nil {
+	first, err := svc.EnqueueTaskForMention(ctx, issueStruct, util.MustParseUUID(agentID), pgtype.UUID{})
+	if err != nil {
 		t.Fatalf("first EnqueueTaskForMention: %v", err)
 	}
 
-	// Second mention for the same (issue, agent) collides on the unique index.
-	_, err := svc.EnqueueTaskForMention(ctx, issueStruct, util.MustParseUUID(agentID), pgtype.UUID{})
+	// Re-delivery of the same assignment revision is idempotent.
+	replayed, err := svc.EnqueueTaskForMention(ctx, issueStruct, util.MustParseUUID(agentID), pgtype.UUID{})
+	if err != nil || replayed.ID != first.ID {
+		t.Fatalf("idempotent replay = task %s err %v, want %s nil", util.UUIDToString(replayed.ID), err, util.UUIDToString(first.ID))
+	}
+
+	// A later issue revision is a distinct event and still collides cleanly on
+	// the one pending slot.
+	issueStruct.Revision++
+	_, err = svc.EnqueueTaskForMention(ctx, issueStruct, util.MustParseUUID(agentID), pgtype.UUID{})
 	if !errors.Is(err, ErrDuplicatePendingTask) {
 		t.Fatalf("second EnqueueTaskForMention: err = %v, want ErrDuplicatePendingTask", err)
 	}
